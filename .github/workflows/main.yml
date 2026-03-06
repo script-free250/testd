@@ -1,0 +1,303 @@
+# ======================================================================
+# .github/workflows/build.yml
+# ======================================================================
+# GitHub Actions Workflow — WiFi Extractor .exe Builder
+# ----------------------------------------------------------------------
+# Triggers  : Push to main/master, Pull Requests, or manual dispatch
+# Runner    : windows-latest  (required — netsh is Windows-only)
+# Python    : 3.11 (latest stable with full tkinter support on Windows)
+# Output    : WiFiExtractor.exe  (single-file, no-console bundle)
+# Release   : Auto-creates a GitHub Release on version tags (v*)
+# ======================================================================
+
+name: Build WiFiExtractor EXE
+
+on:
+  # ── Trigger on pushes to main or master branches ──
+  push:
+    branches:
+      - main
+      - master
+    # Also trigger on version tags to create a Release
+    tags:
+      - "v*.*.*"
+
+  # ── Trigger on pull requests targeting main/master ──
+  pull_request:
+    branches:
+      - main
+      - master
+
+  # ── Allow manual trigger from the GitHub Actions UI ──
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create a GitHub Release after build?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+# ── Cancel in-progress runs for the same branch/PR (saves CI minutes) ──
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ====================================================================
+  # JOB 1: build
+  # Compiles wifi_extractor.py into WiFiExtractor.exe via PyInstaller
+  # ====================================================================
+  build:
+    name: 🏗️ Build EXE on Windows
+    runs-on: windows-latest   # Must be Windows — netsh is Windows-only
+
+    # Expose these values to all steps as environment variables
+    env:
+      PYTHON_VERSION: "3.11"
+      APP_NAME: "WiFiExtractor"
+      DIST_DIR: "dist"        # PyInstaller default output directory
+      BUILD_DIR: "build"      # PyInstaller temp build directory
+
+    steps:
+      # ── Step 1: Check out the repository ──────────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # Full history needed for tag-based releases
+
+      # ── Step 2: Set up Python ─────────────────────────────────────
+      - name: 🐍 Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          # Cache pip packages across runs to speed up subsequent builds
+          cache: "pip"
+
+      # ── Step 3: Verify Python & pip versions ──────────────────────
+      - name: 🔍 Verify Python installation
+        run: |
+          python --version
+          pip --version
+          python -c "import tkinter; print('tkinter OK')"
+
+      # ── Step 4: Upgrade pip and install build dependencies ────────
+      - name: ⬆️ Upgrade pip & install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install pyinstaller
+
+      # ── Step 5: Verify PyInstaller is available ───────────────────
+      - name: 🔍 Verify PyInstaller
+        run: pyinstaller --version
+
+      # ── Step 6: (Optional) Generate a placeholder icon ────────────
+      # If you have an icon.ico in your repo, this step is skipped.
+      # Otherwise we generate a minimal valid .ico so the build won't fail.
+      - name: 🎨 Prepare application icon
+        shell: python
+        run: |
+          import os, struct, zlib
+
+          icon_path = "icon.ico"
+
+          # Skip if a real icon already exists in the repository
+          if os.path.exists(icon_path) and os.path.getsize(icon_path) > 100:
+              print(f"Icon already exists: {icon_path}")
+          else:
+              # Build a minimal 16x16 ICO file programmatically (no Pillow needed)
+              # ICO header: magic + count
+              ico_header = struct.pack("<HHH", 0, 1, 1)
+
+              # Image entry: width, height, colors, reserved, planes, bpp, size, offset
+              # The BMP data offset = 6 (header) + 16 (entry) = 22
+              bmp_width, bmp_height = 16, 16
+              bpp = 32  # 32-bit RGBA
+
+              # BMP DIB header (BITMAPINFOHEADER) — 40 bytes
+              row_bytes = bmp_width * 4  # 4 bytes per pixel (BGRA)
+              bmp_data_size = row_bytes * bmp_height + row_bytes * bmp_height  # XOR + AND mask
+              dib_header = struct.pack(
+                  "<IiiHHIIiiII",
+                  40,            # header size
+                  bmp_width,     # width
+                  bmp_height * 2,# height × 2 for ICO format
+                  1,             # color planes
+                  bpp,           # bits per pixel
+                  0,             # BI_RGB compression
+                  bmp_data_size, # image data size
+                  0, 0,          # pixels per meter (X, Y)
+                  0, 0           # colors used / important
+              )
+
+              # Fill pixels: a simple solid blue square (BGRA: 0, 120, 215, 255)
+              xor_mask = b"\x00\x78\xd7\xff" * (bmp_width * bmp_height)  # Blue pixels
+              and_mask = b"\x00" * (row_bytes * bmp_height)               # Fully opaque
+
+              bmp_payload = dib_header + xor_mask + and_mask
+              total_bmp_size = len(bmp_payload)
+
+              # ICO directory entry
+              entry = struct.pack(
+                  "<BBBBHHII",
+                  bmp_width,       # width
+                  bmp_height,      # height
+                  0,               # color count (0 = 256+)
+                  0,               # reserved
+                  1,               # color planes
+                  bpp,             # bits per pixel
+                  total_bmp_size,  # size of BMP data
+                  6 + 16           # offset to BMP data (header=6, entry=16)
+              )
+
+              with open(icon_path, "wb") as f:
+                  f.write(ico_header + entry + bmp_payload)
+
+              print(f"Generated placeholder icon: {icon_path} ({os.path.getsize(icon_path)} bytes)")
+
+      # ── Step 7: Build the .exe using the .spec file ───────────────
+      - name: 🔨 Build EXE with PyInstaller
+        run: |
+          pyinstaller wifi_extractor.spec `
+            --distpath "${{ env.DIST_DIR }}" `
+            --workpath "${{ env.BUILD_DIR }}" `
+            --noconfirm `
+            --clean
+
+      # ── Step 8: Verify the output .exe exists ─────────────────────
+      - name: ✅ Verify build output
+        shell: pwsh
+        run: |
+          $exePath = Join-Path "${{ env.DIST_DIR }}" "${{ env.APP_NAME }}.exe"
+          if (Test-Path $exePath) {
+              $size = (Get-Item $exePath).Length
+              $sizeMB = [math]::Round($size / 1MB, 2)
+              Write-Host "✅ Build successful!"
+              Write-Host "   File : $exePath"
+              Write-Host "   Size : $sizeMB MB"
+          } else {
+              Write-Error "❌ Build FAILED — ${{ env.APP_NAME }}.exe not found in ${{ env.DIST_DIR }}"
+              exit 1
+          }
+
+      # ── Step 9: Compute SHA256 checksum for integrity verification ─
+      - name: 🔐 Generate SHA256 checksum
+        shell: pwsh
+        run: |
+          $exePath = Join-Path "${{ env.DIST_DIR }}" "${{ env.APP_NAME }}.exe"
+          $hash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash
+          $checksumFile = Join-Path "${{ env.DIST_DIR }}" "${{ env.APP_NAME }}_SHA256.txt"
+          "$hash  ${{ env.APP_NAME }}.exe" | Out-File -FilePath $checksumFile -Encoding UTF8
+          Write-Host "SHA256: $hash"
+
+      # ── Step 10: Upload .exe as a build artifact ──────────────────
+      # This makes the .exe downloadable from the Actions run page
+      # for every push/PR (not just tagged releases).
+      - name: 📤 Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-Windows-x64
+          # Upload both the exe and its checksum
+          path: |
+            ${{ env.DIST_DIR }}/${{ env.APP_NAME }}.exe
+            ${{ env.DIST_DIR }}/${{ env.APP_NAME }}_SHA256.txt
+          # Keep the artifact for 30 days
+          retention-days: 30
+          # Fail the workflow if nothing matched the path pattern
+          if-no-files-found: error
+
+  # ====================================================================
+  # JOB 2: release
+  # Creates a GitHub Release and attaches the .exe when a version tag
+  # is pushed (e.g., git tag v1.0.0 && git push --tags)
+  # ====================================================================
+  release:
+    name: 🚀 Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build   # Wait for the build job to succeed first
+
+    # Only run this job when:
+    #   (a) a version tag was pushed, OR
+    #   (b) the workflow was manually triggered with create_release=true
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event.inputs.create_release == 'true'
+
+    permissions:
+      contents: write   # Required to create releases and upload assets
+
+    steps:
+      # ── Step 1: Check out repo (needed for release notes, etc.) ───
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Step 2: Download the artifact built by the build job ──────
+      - name: 📥 Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: WiFiExtractor-Windows-x64
+          # Download into a local folder called 'release-assets'
+          path: release-assets
+
+      # ── Step 3: List downloaded files for debug visibility ────────
+      - name: 🔍 Inspect downloaded assets
+        run: ls -lh release-assets/
+
+      # ── Step 4: Determine the release version tag ─────────────────
+      - name: 🏷️ Determine release version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="manual-$(date +'%Y%m%d-%H%M%S')"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Release version: ${VERSION}"
+
+      # ── Step 5: Create the GitHub Release and upload assets ───────
+      - name: 🚀 Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "WiFi Extractor ${{ steps.version.outputs.version }}"
+          body: |
+            ## 📡 WiFi Credential Extractor — ${{ steps.version.outputs.version }}
+
+            > ⚠️ **Educational use only.** Use only on your own devices and networks.
+
+            ### 📦 Downloads
+            | File | Description |
+            |------|-------------|
+            | `WiFiExtractor.exe` | Main application (Windows x64, standalone) |
+            | `WiFiExtractor_SHA256.txt` | SHA256 checksum for integrity verification |
+
+            ### ✅ How to verify integrity (PowerShell)
+            ```powershell
+            # Compare output hash with the value in WiFiExtractor_SHA256.txt
+            Get-FileHash .\WiFiExtractor.exe -Algorithm SHA256
+            ```
+
+            ### 🖥️ System Requirements
+            - Windows 10 / 11 (x64)
+            - No installation required — standalone .exe
+            - Run as normal user (no admin rights needed for saved profiles)
+
+            ### 📋 What it does
+            Reads WiFi credentials saved **locally on this machine** using
+            Windows' built-in `netsh wlan` command. No network traffic.
+            No data sent anywhere.
+
+          # Attach the .exe and checksum to the release
+          files: |
+            release-assets/WiFiExtractor.exe
+            release-assets/WiFiExtractor_SHA256.txt
+
+          # Mark as a proper release (not a pre-release) for tag-based runs
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          draft: false
+          generate_release_notes: false
